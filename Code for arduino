@@ -1,0 +1,276 @@
+
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <FastLED.h>
+#include <Adafruit_BMP280.h>
+#include <Servo.h>
+#include <TimeLib.h>
+#include <DS3232RTC.h>
+#include <DHT.h>
+
+#define PIN_PUMP_RELAY      8
+#define PIN_BUZZER          6
+#define PIN_SERVO           3
+#define PIN_AD8232_SDN      2
+
+#define PIN_SOIL_MOISTURE   A0
+#define PIN_AD8232_OUT      A1
+
+#define PIN_DHT_DATA        5
+#define PIN_RESERVED_MIST   7
+
+#define PIN_SD_CS          10
+#define PIN_LED_CLK        9   // used as CLK for APA102
+#define LED_DATA_PIN       11  // used as DATA for APA102
+
+const int DRY_SOIL_THRESHOLD    = 500;
+const float HARSH_LIGHT_THRESHOLD = 30000.0;
+const float ADXL_SHAKE_THRESHOLD  = 5.0;
+const unsigned long LOG_INTERVAL = 5000;
+const int BUFFER_SIZE = 100;
+
+const int ADDR_ADXL345 = 0x53;
+const int ADDR_BH1750  = 0x23;
+
+#define NUM_LEDS 64
+const int SHADE_DEPLOY_ANGLE  = 90;
+const int SHADE_RETRACT_ANGLE = 0;
+#define DHTTYPE DHT11
+
+File logFile;
+Adafruit_BMP280 bmp;
+CRGB leds[NUM_LEDS];
+Servo shadeServo;
+DHT dht(PIN_DHT_DATA, DHTTYPE);
+
+DS3232RTC myRTC;
+uint16_t bioBuffer[BUFFER_SIZE];
+int bufferHead = 0;
+unsigned long lastLogTime = 0;
+float lastAccelMag = 0;
+unsigned long lastShakeMillis = 0;
+const unsigned long SHAKE_DEBOUNCE_MS = 1000; // 1s
+
+const byte EMOTION_HAPPY[] = { 0b00000000,0b01000100,0b01000100,0b00000000,0b00011100,0b00100100,0b00100100,0b00011100 };
+const byte EMOTION_SAD[]   = { 0b00000000,0b01000100,0b01000100,0b00000000,0b00011100,0b01000000,0b01000000,0b00011100 };
+
+time_t getRTC();
+void setupADXL345();
+void readADXL345(float *x, float *y, float *z);
+float readBH1750Lux();
+void logData(int soil, float lux, float temp, float press, float humid, int bio, const char *event);
+void setEmotion(const byte *bitmap, CRGB color);
+void checkADXLStimulus();
+void captureEventData(const char *eventType);
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  pinMode(PIN_PUMP_RELAY, OUTPUT);
+  pinMode(PIN_AD8232_SDN, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_PUMP_RELAY, HIGH);
+  digitalWrite(PIN_AD8232_SDN, LOW);
+
+  dht.begin();
+  if (!bmp.begin(0x76)) Serial.println("BMP280 init failed");
+
+  shadeServo.attach(PIN_SERVO);
+  shadeServo.write(SHADE_RETRACT_ANGLE);
+
+  FastLED.addLeds<APA102, LED_DATA_PIN, PIN_LED_CLK, BGR>(leds, NUM_LEDS);
+  FastLED.setBrightness(100);
+  setEmotion(EMOTION_HAPPY, CRGB::Green);
+
+  if (!SD.begin(PIN_SD_CS)) {
+    Serial.println("SD init failed");
+  } else {
+    if (!SD.exists("PLANTLOG.CSV")) {
+      File f = SD.open("PLANTLOG.CSV", FILE_WRITE);
+      if (f) {
+        f.println("Time,Soil,Lux,Temp,Press,Humid,BioSig,Event");
+        f.close();
+      }
+    }
+    if (!SD.exists("HRES_LOG.CSV")) {
+      File fh = SD.open("HRES_LOG.CSV", FILE_WRITE);
+      if (fh) fh.close();
+    }
+  }
+
+  myRTC.begin();
+  setSyncProvider(getRTC);
+  setupADXL345();
+
+  Serial.println("System Initialized.");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Buffer bio-signal (fast)
+  uint16_t bioVal = analogRead(PIN_AD8232_OUT);
+  bioBuffer[bufferHead] = bioVal;
+  bufferHead = (bufferHead + 1) % BUFFER_SIZE;
+
+  checkADXLStimulus();
+
+  if (currentMillis - lastLogTime >= LOG_INTERVAL) {
+    lastLogTime = currentMillis;
+
+    int soilMoisture = analogRead(PIN_SOIL_MOISTURE);
+    float temp = bmp.readTemperature();
+    float press = bmp.readPressure();
+    float humid = dht.readHumidity();
+    if (isnan(humid)) humid = -1.0;
+    float currentLux = readBH1750Lux();
+
+    const char *currentEvent = "NONE";
+
+    if (soilMoisture > DRY_SOIL_THRESHOLD) {
+      digitalWrite(PIN_PUMP_RELAY, LOW);
+      currentEvent = "WATERING_ON";
+      setEmotion(EMOTION_SAD, CRGB::Blue);
+      tone(PIN_BUZZER, 200, 500);
+    } else {
+      digitalWrite(PIN_PUMP_RELAY, HIGH);
+      if (strcmp(currentEvent, "NONE") == 0) setEmotion(EMOTION_HAPPY, CRGB::Green);
+    }
+
+    bool isShadeDeployed = (shadeServo.read() > SHADE_RETRACT_ANGLE);
+    if (currentLux > HARSH_LIGHT_THRESHOLD && !isShadeDeployed) {
+      shadeServo.write(SHADE_DEPLOY_ANGLE);
+      currentEvent = "SHADE_DEPLOYED";
+      setEmotion(EMOTION_SAD, CRGB::Red);
+    } else if (currentLux < (HARSH_LIGHT_THRESHOLD * 0.9) && isShadeDeployed) {
+      shadeServo.write(SHADE_RETRACT_ANGLE);
+      currentEvent = "SHADE_RETRACTED";
+    }
+
+    logData(soilMoisture, currentLux, temp, press, humid, bioVal, currentEvent);
+  }
+
+  delay(10);
+}
+
+time_t getRTC() { return myRTC.get(); }
+
+#define ADXL345_ADDRESS 0x53
+#define POWER_CTL_ADDRESS 0x2D
+#define DATA_FORMAT_ADDRESS 0x31
+
+void setupADXL345() {
+  Wire.beginTransmission(ADXL345_ADDRESS);
+  Wire.write(DATA_FORMAT_ADDRESS);
+  Wire.write(0x0B);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(ADXL345_ADDRESS);
+  Wire.write(POWER_CTL_ADDRESS);
+  Wire.write(0x08);
+  Wire.endTransmission();
+}
+
+void readADXL345(float *x, float *y, float *z) {
+  int16_t accel_raw[3] = {0,0,0};
+  Wire.beginTransmission(ADXL345_ADDRESS);
+  Wire.write(0x32);
+  Wire.endTransmission(false);
+  if (Wire.requestFrom(ADXL345_ADDRESS, 6) == 6) {
+    uint8_t lx = Wire.read();
+    uint8_t hx = Wire.read();
+    uint8_t ly = Wire.read();
+    uint8_t hy = Wire.read();
+    uint8_t lz = Wire.read();
+    uint8_t hz = Wire.read();
+    accel_raw[0] = (int16_t)((hx << 8) | lx);
+    accel_raw[1] = (int16_t)((hy << 8) | ly);
+    accel_raw[2] = (int16_t)((hz << 8) | lz);
+  }
+  const float scale_factor = 0.00384; // corrected scale (~4mg/LSB typical)
+  *x = accel_raw[0] * scale_factor;
+  *y = accel_raw[1] * scale_factor;
+  *z = accel_raw[2] * scale_factor;
+}
+
+float readBH1750Lux() {
+  // Continuous H-Resolution Mode (0x10), measurement time ~120ms
+  Wire.beginTransmission(ADDR_BH1750);
+  Wire.write(0x10);
+  Wire.endTransmission();
+
+  delay(180); // wait for measurement
+
+  Wire.requestFrom(ADDR_BH1750, 2);
+  if (Wire.available() >= 2) {
+    uint16_t raw = (Wire.read() << 8) | Wire.read();
+    return raw / 1.2; // per BH1750 datasheet
+  }
+  return -1.0;
+}
+
+void setEmotion(const byte *bitmap, CRGB color) {
+  // map 8x8 to leds array contiguous
+  for (int i = 0; i < NUM_LEDS; ++i) leds[i] = CRGB::Black;
+  for (int row = 0; row < 8; ++row) {
+    byte rowb = bitmap[row];
+    for (int col = 0; col < 8; ++col) {
+      if (rowb & (1 << (7 - col))) {
+        int index = row * 8 + col;
+        if (index >= 0 && index < NUM_LEDS) leds[index] = color;
+      }
+    }
+  }
+  FastLED.show();
+}
+
+void checkADXLStimulus() {
+  float x, y, z;
+  readADXL345(&x, &y, &z);
+  float total_accel = sqrt(x * x + y * y + z * z);
+  float diff = fabs(total_accel - lastAccelMag);
+
+  if (diff > ADXL_SHAKE_THRESHOLD && (millis() - lastShakeMillis) > SHAKE_DEBOUNCE_MS) {
+    lastShakeMillis = millis();
+    captureEventData("SHAKE");
+    setEmotion(EMOTION_SAD, CRGB::Purple);
+    tone(PIN_BUZZER, 800, 100);
+  }
+  lastAccelMag = total_accel;
+}
+
+void logData(int soil, float lux, float temp, float press, float humid, int bio, const char *event) {
+  // Use char buffer to avoid String heap fragmentation
+  char buf[128];
+  snprintf(buf, sizeof(buf), "%lu,%d,%.1f,%.2f,%.2f,%.1f,%d,%s", now(), soil, lux, temp, press, humid, bio, event);
+
+  File f = SD.open("PLANTLOG.CSV", FILE_WRITE);
+  if (f) {
+    f.println(buf);
+    f.close();
+  }
+}
+
+void captureEventData(const char *eventType) {
+  File highRes = SD.open("HRES_LOG.CSV", FILE_WRITE);
+  if (!highRes) return;
+
+  highRes.println("EventType,BioSignal_Raw");
+  highRes.print(eventType);
+  highRes.println(","); // simple header event
+
+  int idx = bufferHead;
+  for (int i = 0; i < BUFFER_SIZE; i++) {
+    highRes.println(bioBuffer[idx]);
+    idx = (idx + 1) % BUFFER_SIZE;
+  }
+
+  for (int i = 0; i < 50; i++) {
+    int val = analogRead(PIN_AD8232_OUT);
+    highRes.println(val);
+    delay(10);
+  }
+  highRes.close();
+}
